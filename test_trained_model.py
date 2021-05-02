@@ -1,16 +1,15 @@
-from models.yolo import Model
-from models.experimental import attempt_load
-import cv2
-import torchvision
-import numpy as np
-from utils.torch_utils import select_device, load_classifier, time_synchronized
-import torch
+import os
 import random
-from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
-    scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path
 import time
-
 from glob import glob as glob
+
+import cv2
+import numpy as np
+import torch
+import torchvision
+import math
+
+from models.experimental import attempt_load
 
 if torch.cuda.device_count() > 0:
     print("RUNNING ON GPU")
@@ -18,6 +17,40 @@ if torch.cuda.device_count() > 0:
 else:
     print("RUNNING ON CPU")
     DEVICE = torch.device('cpu')
+
+
+def time_synchronized():
+    # pytorch-accurate time
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.time()
+
+
+def make_divisible(x, divisor):
+    # Returns x evenly divisible by divisor
+    return math.ceil(x / divisor) * divisor
+
+
+def check_img_size(img_size, s=32):
+    # Verify img_size is a multiple of stride s
+    new_size = make_divisible(img_size, int(s))  # ceil gs-multiple
+    if new_size != img_size:
+        print('WARNING: --img-size %g must be multiple of max stride %g, updating to %g' % (img_size, s, new_size))
+    return new_size
+
+
+def plot_one_box(x, img, color=None, label=None, line_thickness=3):
+    # Plots one bounding box on image img
+    tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
+    color = color or [random.randint(0, 255) for _ in range(3)]
+    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    if label:
+        tf = max(tl - 1, 1)  # font thickness
+        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
 
 def xywh2xyxy(x):
@@ -28,6 +61,63 @@ def xywh2xyxy(x):
     y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
     y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
     return y
+
+
+def xyxy2xywh(x):
+    # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[:, 0] = (x[:, 0] + x[:, 2]) / 2  # x center
+    y[:, 1] = (x[:, 1] + x[:, 3]) / 2  # y center
+    y[:, 2] = x[:, 2] - x[:, 0]  # width
+    y[:, 3] = x[:, 3] - x[:, 1]  # height
+    return y
+
+
+def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
+    def clip_coords(boxes, img_shape):
+        # Clip bounding xyxy bounding boxes to image shape (height, width)
+        boxes[:, 0].clamp_(0, img_shape[1])  # x1
+        boxes[:, 1].clamp_(0, img_shape[0])  # y1
+        boxes[:, 2].clamp_(0, img_shape[1])  # x2
+        boxes[:, 3].clamp_(0, img_shape[0])  # y2
+
+    # Rescale coords (xyxy) from img1_shape to img0_shape
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
+    else:
+        gain = ratio_pad[0][0]
+        pad = ratio_pad[1]
+
+    coords[:, [0, 2]] -= pad[0]  # x padding
+    coords[:, [1, 3]] -= pad[1]  # y padding
+    coords[:, :4] /= gain
+    clip_coords(coords, img0_shape)
+    return coords
+
+def box_iou(box1, box2):
+    # https://github.com/pytorch/vision/blob/master/torchvision/ops/boxes.py
+    """
+    Return intersection-over-union (Jaccard index) of boxes.
+    Both sets of boxes are expected to be in (x1, y1, x2, y2) format.
+    Arguments:
+        box1 (Tensor[N, 4])
+        box2 (Tensor[M, 4])
+    Returns:
+        iou (Tensor[N, M]): the NxM matrix containing the pairwise
+            IoU values for every element in boxes1 and boxes2
+    """
+
+    def box_area(box):
+        # box = 4xn
+        return (box[2] - box[0]) * (box[3] - box[1])
+
+    area1 = box_area(box1.T)
+    area2 = box_area(box2.T)
+
+    # inter(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
+    inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
+    return inter / (area1[:, None] + area2 - inter)  # iou = inter / (area1 + area2 - inter)
 
 
 def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
@@ -154,28 +244,10 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
     return img, ratio, (dw, dh)
 
 
-def detect(model, test_path, classes, save_img=False):
-    weights = 'yolov5.pt'
+def detect(model, test_path, save_dir, save_img=False):
     img_size = 640
-
-    if torch.cuda.device_count() > 0:
-        print("RUNNING ON GPU")
-        DEVICE = torch.device('cuda')
-    else:
-        print("RUNNING ON CPU")
-        DEVICE = torch.device('cpu')
-
-    half = False
-
-    # Load model
-    model = attempt_load(weights, map_location=DEVICE)  # load FP32 model
     stride = int(model.stride.max())  # model stride
     img_size = check_img_size(img_size, s=stride)  # check img_size
-    if half:
-        model.half()  # to FP16
-
-    # Set Dataloader
-    vid_path, vid_writer = None, None
 
     # Get names and colors
     names = model.module.names if hasattr(model, 'module') else model.names
@@ -185,36 +257,38 @@ def detect(model, test_path, classes, save_img=False):
     if DEVICE.type != 'cpu':
         model(torch.zeros(1, 3, img_size, img_size).to(DEVICE).type_as(next(model.parameters())))  # run once
     t0 = time.time()
-    imgs = glob(test_path)
+    imgs = glob(os.path.join(test_path, "*.jpg"))
     for img_file in imgs:
         # the model takes in RGB
         im0 = cv2.imread(img_file)
         img = cv2.imread(img_file)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         # the resizing technique used by this project
-        img = letterbox(img, (img_size, img_size), stride=32)  # using the default values
+        img = letterbox(img, (img_size, img_size), stride=32)[0]  # using the default values
         # img /= 255.0 # normalization
         # change (HxWxC) -> (CxHxW)
-        img_tensor = torchvision.transforms.ToTensor()(img)  # this takes care of normalization as well. I did not know that
+        img_tensor = torchvision.transforms.ToTensor()(
+            img)  # this takes care of normalization as well. I did not know that
         img_tensor = img_tensor.half() if half else img_tensor.float()  # uint8 to fp16/32
         if img_tensor.ndimension() == 3:
             img_tensor = img_tensor.unsqueeze(0)
 
-        pred = model(img_tensor, augment=False)[0] # returns y, None
+        t1 = time_synchronized()
+        pred = model(img_tensor, augment=False)[0]  # returns y, None
 
-        pred = non_max_suppression(pred, conf_thres=0.25, iou_thres=0.45, classes=classes, agnostic=False)
+        pred = non_max_suppression(pred, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False)
+        t2 = time_synchronized()
 
         # Process detections
         for i, det in enumerate(pred):  # detections per image
-
-            p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # img.jpg
-            txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # img.txt
-            s += '%gx%g ' % img.shape[2:]  # print string
+            save_name = img_file.split("/")[-1].split(".")[0] + "_output.jpg"
+            txt_path = img_file.split("/")[-1].split(".")[0] + "_text"
+            s = ''
+            s += '%gx%g ' % img_tensor.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             if len(det):
                 # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                det[:, :4] = scale_coords(img_tensor.shape[2:], det[:, :4], im0.shape).round()
 
                 # Print results
                 for c in det[:, -1].unique():
@@ -223,98 +297,96 @@ def detect(model, test_path, classes, save_img=False):
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
-                    if save_txt:  # Write to file
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
-                        with open(txt_path + '.txt', 'a') as f:
-                            f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                    line = (cls, *xywh, conf)
+                    with open(txt_path + '.txt', 'a') as f:
+                        f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
-                    if save_img or view_img:  # Add bbox to image
+                    if save_img:  # Add bbox to image
                         label = f'{names[int(cls)]} {conf:.2f}'
                         plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
 
+            # Print time (inference + NMS)
+            print(f'{s}Done. ({t2 - t1:.3f}s)')
+            cv2.imwrite(os.path.join(save_dir, save_name), im0)
 
-    if save_txt or save_img:
-        s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        print(f"Results saved to {save_dir}{s}")
+    print(f"Results saved to {save_dir}")
 
     print(f'Done. ({time.time() - t0:.3f}s)')
 
 
 if __name__ == '__main__':
     classes = ["Aluminium foil",
-     "Battery",
-     "Aluminium blister pack",
-     "Carded blister pack",
-     "Other plastic bottle",
-     "Clear plastic bottle",
-     "Glass bottle",
-     "Plastic bottle cap",
-     "Metal bottle cap",
-     "Broken glass",
-     "Food Can",
-     "Aerosol",
-     "Drink can",
-     "Toilet tube",
-     "Other carton",
-     "Egg carton",
-     "Drink carton",
-     "Corrugated carton",
-     "Meal carton",
-     "Pizza box",
-     "Paper cup",
-     "Disposable plastic cup",
-     "Foam cup",
-     "Glass cup",
-     "Other plastic cup",
-     "Food waste",
-     "Glass jar",
-     "Plastic lid",
-     "Metal lid",
-     "Other plastic",
-     "Magazine paper",
-     "Tissues",
-     "Wrapping paper",
-     "Normal paper",
-     "Paper bag",
-     "Plastified paper bag",
-     "Plastic film",
-     "Six pack rings",
-     "Garbage bag",
-     "Other plastic wrapper",
-     "Single-use carrier bag",
-     "Polypropylene bag",
-     "Crisp packet",
-     "Spread tub",
-     "Tupperware",
-     "Disposable food container",
-     "Foam food container",
-     "Other plastic container",
-     "Plastic glooves",
-     "Plastic utensils",
-     "Pop tab",
-     "Rope & strings",
-     "Scrap metal",
-     "Shoe",
-     "Squeezable tube",
-     "Plastic straw",
-     "Paper straw",
-     "Styrofoam piece",
-     "Unlabeled litter",
-     "Cigarette"
-     ]
+               "Battery",
+               "Aluminium blister pack",
+               "Carded blister pack",
+               "Other plastic bottle",
+               "Clear plastic bottle",
+               "Glass bottle",
+               "Plastic bottle cap",
+               "Metal bottle cap",
+               "Broken glass",
+               "Food Can",
+               "Aerosol",
+               "Drink can",
+               "Toilet tube",
+               "Other carton",
+               "Egg carton",
+               "Drink carton",
+               "Corrugated carton",
+               "Meal carton",
+               "Pizza box",
+               "Paper cup",
+               "Disposable plastic cup",
+               "Foam cup",
+               "Glass cup",
+               "Other plastic cup",
+               "Food waste",
+               "Glass jar",
+               "Plastic lid",
+               "Metal lid",
+               "Other plastic",
+               "Magazine paper",
+               "Tissues",
+               "Wrapping paper",
+               "Normal paper",
+               "Paper bag",
+               "Plastified paper bag",
+               "Plastic film",
+               "Six pack rings",
+               "Garbage bag",
+               "Other plastic wrapper",
+               "Single-use carrier bag",
+               "Polypropylene bag",
+               "Crisp packet",
+               "Spread tub",
+               "Tupperware",
+               "Disposable food container",
+               "Foam food container",
+               "Other plastic container",
+               "Plastic glooves",
+               "Plastic utensils",
+               "Pop tab",
+               "Rope & strings",
+               "Scrap metal",
+               "Shoe",
+               "Squeezable tube",
+               "Plastic straw",
+               "Paper straw",
+               "Styrofoam piece",
+               "Unlabeled litter",
+               "Cigarette"
+               ]
     weights = 'yolov5s.pt'
 
+    save_dir = "outputs"
+    if not os.path.isdir(save_dir):
+        os.mkdir(save_dir)
+
     model = attempt_load(weights, map_location='cpu')
-    img = cv2.imread('test.jpg')
-    img = cv2.resize(img, (640, 640), interpolation=cv2.INTER_AREA)
+    half = False
+    if half:
+        model.half()  # to FP16
 
-    img_tensor = torchvision.transforms.ToTensor()(img)
-    print(img_tensor.shape)
-    img_tensor = img_tensor.unsqueeze(0)
-    bbox = model(img_tensor)
-    print(len(bbox))
-    print(bbox[0].shape)
-
-    test_path = ""
-    detect(model=model, test_path=test_path, classes=classes, save_img=True)
+    test_path = "test_imgs"
+    detect(model=model, test_path=test_path, save_img=True, save_dir=save_dir)
