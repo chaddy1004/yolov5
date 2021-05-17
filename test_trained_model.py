@@ -384,6 +384,8 @@ if __name__ == '__main__':
         os.mkdir(save_dir)
 
     model = attempt_load(weights, map_location='cpu')
+
+
     half = False
     if half:
         model.half()  # to FP16

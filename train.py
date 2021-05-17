@@ -236,6 +236,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss = ComputeLoss(model)  # init loss class
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
+                f'Number of Classses, {nc}\n'
+                f'Class names, {names}\n'
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')

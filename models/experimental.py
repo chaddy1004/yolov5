@@ -115,6 +115,20 @@ def attempt_load(weights, map_location=None):
     model = Ensemble()
     for w in weights if isinstance(weights, list) else [weights]:
         attempt_download(w)
+        """
+        recall:
+            ckpt = {'epoch': epoch,
+            'best_fitness': best_fitness,
+            'training_results': results_file.read_text(),
+            'model': deepcopy(model.module if is_parallel(model) else model).half(),
+            'ema': deepcopy(ema.ema).half(),
+            'updates': ema.updates,
+            'optimizer': optimizer.state_dict(),
+            'wandb_id': wandb_run.id if wandb else None}
+
+            # Save last, best and delete
+            torch.save(ckpt, last)
+        """
         ckpt = torch.load(w, map_location=map_location)  # load
         model.append(ckpt['ema' if ckpt.get('ema') else 'model'].float().fuse().eval())  # FP32 model
 
